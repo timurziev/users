@@ -1,0 +1,242 @@
+version: '3.8'
+
+services:
+
+    router:
+        container_name: test_router
+        image: traefik
+        command:
+            - "--global.sendAnonymousUsage=false"
+            # Docker Provider configuration
+            - "--providers.docker"
+            - "--providers.docker.exposedByDefault=false"
+            - "--providers.docker.network=expose"
+            # Configure entrypoint
+            - "--entrypoints.web.address=:80"
+            - "--entrypoints.mysql.address=:3306"
+            - "--entrypoints.redis.address=:6379"
+            - "--entrypoints.minio.address=:9191"
+            # Enable dashboard, exposed to http://router.HOSTNAME (Based on DEV_HOSTNAME, test.test is the default)
+            - "--api.dashboard=true"
+            - "--pilot.dashboard=false"
+        ports:
+            - "80:80"
+            - "3306:3306"
+            - "6379:6379"
+            - "9191:9191"
+        volumes:
+            - /etc/timezone:/etc/timezone:ro
+            - /etc/localtime:/etc/localtime:ro
+            # ----------------------------------
+            # /!\ This is NOT production-safe /!\
+            # -----------------------------------
+            # UNIX Socket
+            - /var/run/docker.sock:/var/run/docker.sock
+        networks:
+            - router
+            - internal
+        deploy:
+            placement:
+                constraints:
+                    - node.role == manager
+        labels:
+            - "traefik.enable=true"
+            - "traefik.http.routers.traefik.rule=Host(`router.${DEV_HOSTNAME:-test.test}`)"
+            - "traefik.http.routers.traefik.service=api@internal"
+            - "traefik.http.services.traefik-srv.loadbalancer.server.port=8080"
+
+    webserver:
+        container_name: test_webserver
+        image: nginx:alpine
+        volumes:
+            - .:/app
+            - .docker/nginx/app.conf:/etc/nginx/conf.d/app.conf
+            - /etc/timezone:/etc/timezone:ro
+            - /etc/localtime:/etc/localtime:ro
+        depends_on:
+            - app
+        networks:
+            - internal
+        healthcheck:
+            test: wget --quiet --tries=1 --spider http://localhost || exit 1z
+            interval: 30s
+            timeout: 10s
+            retries: 5
+        labels:
+            - "traefik.enable=true"
+            - "traefik.http.routers.webserver.priority=1"
+            - "traefik.http.routers.webserver.rule=HostRegexp(`${DEV_HOSTNAME:-test.test}`, `{[a-z]+}.${DEV_HOSTNAME:-test.test}`)"
+            - "traefik.http.services.webserver-srv.loadbalancer.server.port=80"
+
+    app:
+        container_name: test_app
+        # Only forward these env variables from the .env file into the container directly.
+        environment:
+            - DEV_HOSTNAME=${DEV_HOSTNAME}
+            - ENABLE_WORKER=${ENABLE_WORKER}
+            - PHP_IDE_CONFIG=${PHP_IDE_CONFIG}
+        build:
+            context: .docker
+            dockerfile: php-8.2.dockerfile
+        volumes:
+            - .:/app
+            - .docker/php/php.development.ini:/usr/local/etc/php/conf.d/zz-customizations.ini
+            - /etc/timezone:/etc/timezone:ro
+            - /etc/localtime:/etc/localtime:ro
+        depends_on:
+            - mysql
+            - redis
+            - mail
+            - meilisearch
+        #            - minio
+        networks:
+            - internal
+            - router
+
+    mysql:
+        container_name: test_mysql
+        image: mysql/mysql-server
+        command: --default-authentication-plugin=mysql_native_password
+        environment:
+            MYSQL_ROOT_PASSWORD: "${DB_PASSWORD:-toor}"
+            MYSQL_DATABASE: "${DB_DATABASE:-forge}"
+            MYSQL_USER: "${DB_USERNAME:-forge}"
+            MYSQL_PASSWORD: "${DB_PASSWORD:-forge}"
+            MYSQL_ALLOW_EMPTY_PASSWORD: 'yes'
+        volumes:
+#            - '.dockerpersist/mysql:/var/lib/mysql'
+            - 'test-db:/var/lib/mysql'
+            - '.docker/mysql-initdb.d:/docker-entrypoint-initdb.d'
+            - /etc/timezone:/etc/timezone:ro
+            - /etc/localtime:/etc/localtime:ro
+        networks:
+            - internal
+            - router
+        ports:
+            - '${FORWARD_MYSQL_PORT:-33066}:3306'
+        healthcheck:
+            test: "mysqladmin ping -p${DB_PASSWORD}"
+            retries: 3
+            timeout: 5s
+        labels:
+            - "traefik.enable=true"
+            - "traefik.tcp.routers.mysql.rule=HostSNI(`*`)"
+            - "traefik.tcp.routers.mysql.entrypoints=mysql"
+            - "traefik.tcp.routers.mysql.service=mysql-svc"
+            - "traefik.tcp.services.mysql-svc.loadbalancer.server.port=3306"
+
+    redis:
+        container_name: test_redis
+        image: 'redis:alpine'
+        volumes:
+            - /etc/timezone:/etc/timezone:ro
+            - /etc/localtime:/etc/localtime:ro
+        networks:
+            - internal
+        healthcheck:
+            test: redis-cli ping
+            retries: 3
+            timeout: 5s
+        labels:
+            - "traefik.enable=true"
+            - "traefik.tcp.routers.redis.rule=HostSNI(`*`)"
+            - "traefik.tcp.routers.redis.entrypoints=redis"
+            - "traefik.tcp.routers.redis.service=redis-svc"
+            - "traefik.tcp.services.redis-svc.loadbalancer.server.port=6379"
+
+    # NOTE: NodeJS container won't auto-start.
+    # Load using: docker compose up nodejs
+    # (docker-compose on some systems)
+    node:
+        container_name: test_node
+        image: node:18-alpine
+        environment:
+            TERM: xterm-256color
+        tty: true
+        working_dir: '/app'
+        networks:
+            - internal
+        volumes:
+            - .:/app
+            - /etc/timezone:/etc/timezone:ro
+            - /etc/localtime:/etc/localtime:ro
+        command: 'tail -f /dev/null'
+        labels:
+            - "traefik.enable=true"
+            - "traefik.http.routers.node.entrypoints=web"
+            - "traefik.http.routers.node.rule=Host(`node.${DEV_HOSTNAME:-test.test}`)"
+            - "traefik.http.services.node-srv.loadbalancer.server.port=8080"
+
+    mail:
+        container_name: test_mail
+        image: 'sj26/mailcatcher'
+        networks:
+            - internal
+        volumes:
+            - /etc/timezone:/etc/timezone:ro
+            - /etc/localtime:/etc/localtime:ro
+        labels:
+            - "traefik.enable=true"
+            - "traefik.http.routers.mail.rule=Host(`mail.${DEV_HOSTNAME:-test.test}`)"
+            - "traefik.http.services.mail-srv.loadbalancer.server.port=1080"
+
+    # NOTE: phpmyadmin container won't auto-start.
+    # Load using: docker compose up phpmyadmin -d
+    # (docker-compose on some systems)
+    phpmyadmin:
+        container_name: test_phpmyadmin
+        image: 'phpmyadmin'
+        env_file: .env
+        environment:
+            - PMA_HOST=mysql
+            - DB_DATABASE="${DB_DATABASE:-forge}"
+            - DB_USERNAME="${DB_USERNAME:-forge}"
+            - DB_PASSWORD="${DB_PASSWORD:-forge}"
+        volumes:
+            - '.docker/phpmyadmin.config.php:/etc/phpmyadmin/config.user.inc.php'
+            - /etc/timezone:/etc/timezone:ro
+            - /etc/localtime:/etc/localtime:ro
+        networks:
+            - internal
+        depends_on:
+            - mysql
+        labels:
+            - "traefik.enable=true"
+            - "traefik.http.routers.db_manager.rule=Host(`db.${DEV_HOSTNAME:-test.test}`)"
+            - "traefik.http.services.db_manager-srv.loadbalancer.server.port=80"
+
+    # Search engine
+    meilisearch:
+        container_name: test_meilisearch
+        image: 'getmeili/meilisearch:latest'
+        environment:
+            - MEILI_ENV=development
+            - MEILI_NO_ANALYTICS=true
+            - MEILI_MASTER_KEY=TheKeyIsALie
+        ports:
+            - '${FORWARD_MEILI_PORT:-7700}:7700'
+        volumes:
+            - 'test-meili:/meili_data/data.ms'
+            - /etc/timezone:/etc/timezone:ro
+            - /etc/localtime:/etc/localtime:ro
+        networks:
+            - internal
+        healthcheck:
+            test: [ "CMD", "wget", "--no-verbose", "--spider",  "http://localhost:7700/health" ]
+            retries: 3
+            timeout: 5s
+        labels:
+            - "traefik.enable=true"
+            - "traefik.http.routers.melisearch.rule=Host(`meili.${DEV_HOSTNAME:-test.test}`)"
+            - "traefik.http.services.melisearch-srv.loadbalancer.server.port=7700"
+
+networks:
+    internal:
+        driver: bridge
+        internal: true
+    router:
+        name: traefik_router
+
+volumes:
+    test-db:
+    test-meili:

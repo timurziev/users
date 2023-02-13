@@ -1,0 +1,9 @@
+node_modules
+npm-debug.log
+Dockerfile
+.dockerignore
+/.docker/mysql-initdb.d/
+/.docker/nginx
+/.docker/persist
+/.docker/php
+/.dockerpersist/
